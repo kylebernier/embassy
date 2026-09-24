@@ -496,6 +496,8 @@ pub struct Config {
     /// Enable the B-peripheral session valid override with 'bvaloen' and control the value with 'bvaloval'.
     pub vbus_valid_override: bool,
 
+    pub dma_enable: bool,
+
     /// Enable transceiver delay.
     ///
     /// Some ULPI PHYs like the Microchip USB334x series require a delay between the ULPI register write that initiates
@@ -510,6 +512,7 @@ impl Default for Config {
         Self {
             vbus_detection: false,
             vbus_valid_override: false,
+            dma_enable: false,
             xcvrdly: false,
         }
     }
@@ -888,7 +891,9 @@ where
             w.set_wuim(true);
             w.set_iepint(true);
             w.set_oepint(true);
-            w.set_rxflvlm(true);
+            if !self.config.dma_enable {
+                w.set_rxflvlm(true);
+            }
             w.set_srqim(true);
             w.set_otgint(true);
             w.set_iisoixfrm(true);
@@ -929,6 +934,9 @@ where
     pub fn configure_as_device(&mut self) {
         let r = self.instance.regs;
         let phy_type = self.instance.phy_type;
+
+        // Wait for AHB ready. Remove this?
+        while !r.grstctl().read().ahbidl() {}
 
         // Read PHY data width from GHWCFG4:
         // 0 = 8-bit only, 1 = 16-bit only, 2 = software selectable (default to 8-bit)
@@ -973,6 +981,42 @@ where
 
         // Wait for device mode ready
         while r.gintsts().read().cmod() {}
+
+        // Core soft reset?
+        self.core_soft_reset();
+
+        // Enable DMA
+        if self.config.dma_enable {
+            r.gdfifocfg().modify(|w| {
+                let mut val = r.gdfifocfg().read();
+                val &= !0xFFFF_0000; // Mask
+                val |= 0x03EE_0000; // Value
+                w.clone_from(&mut val);
+            });
+
+            r.gahbcfg().modify(|w| {
+                w.set_hbstlen(0b0011); // INCR4
+                w.set_dmaen(true);
+            });
+        }
+
+        // Configure Core
+        let core_id = r.cid().read().0;
+        trace!("Core id {:08x}", core_id);
+
+        match core_id {
+            0x0000_1000 |
+            0x0000_1100 |
+            0x0000_1200 => self.config_v1(),
+            0x0000_2000 |
+            0x0000_2100 |
+            0x0000_2300 |
+            0x0000_3000 |
+            0x0000_3100 => self.config_v2v3(),
+            0x0000_5000 |
+            0x0000_6100 => self.config_v5(),
+            _ => unimplemented!("Unknown USB core id {:X}", core_id),
+        }
     }
 
     /// Applies configuration specific to
@@ -1027,6 +1071,9 @@ where
         let phy_type = self.instance.phy_type;
 
         if phy_type == PhyType::InternalHighSpeed {
+            r.gotgctl().modify(|w| {
+                w.set_bvaloen(self.config.vbus_valid_override);
+            });
             r.gccfg_v3().modify(|w| {
                 w.set_vbvaloven(!self.config.vbus_detection);
                 if !self.config.vbus_valid_override {
